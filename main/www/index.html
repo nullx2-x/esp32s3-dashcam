@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO ドラレコ</title>
+<style>
+  :root { --bg:#111418; --card:#1b2027; --line:#2c333d; --text:#e8ecf1; --dim:#93a0b0; --accent:#3d8bfd; --rec:#e5484d; --ok:#30a46c; --warn:#f5a524; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:.6rem; padding:.7rem 1rem; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:2; flex-wrap:wrap; }
+  header h1 { font-size:1.05rem; margin:0; margin-right:auto; }
+  .badge { font-size:.75rem; padding:.15rem .5rem; border-radius:99px; background:var(--line); color:var(--dim); white-space:nowrap; }
+  .badge.rec { background:var(--rec); color:#fff; } .badge.ok { background:var(--ok); color:#fff; } .badge.warn { background:var(--warn); color:#111; }
+  main { max-width:960px; margin:0 auto; padding:1rem; display:grid; gap:1rem; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1rem; }
+  h2 { font-size:.95rem; margin:0 0 .8rem; color:var(--dim); font-weight:600; }
+  .live { width:100%; aspect-ratio:16/9; background:#000; border-radius:8px; object-fit:contain; display:block; }
+  .row { display:flex; gap:.5rem; flex-wrap:wrap; margin-top:.7rem; }
+  button { font:inherit; font-size:.9rem; border:1px solid var(--line); background:#252c35; color:var(--text); padding:.5rem .9rem; border-radius:8px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { background:transparent; border-color:var(--rec); color:var(--rec); }
+  button.small { padding:.25rem .55rem; font-size:.8rem; }
+  button:disabled { opacity:.5; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:.6rem; }
+  .kv { background:#151a20; border-radius:8px; padding:.55rem .7rem; }
+  .kv .k { font-size:.72rem; color:var(--dim); } .kv .v { font-size:.92rem; margin-top:.15rem; word-break:break-all; }
+  .err { color:var(--rec); font-size:.85rem; margin-top:.5rem; }
+  table { width:100%; border-collapse:collapse; font-size:.85rem; }
+  td { padding:.45rem .3rem; border-bottom:1px solid var(--line); vertical-align:middle; }
+  td.actions { text-align:right; white-space:nowrap; }
+  .lock { color:var(--warn); font-size:.75rem; margin-left:.3rem; }
+  form { display:grid; gap:.7rem; }
+  label { display:grid; gap:.25rem; font-size:.82rem; color:var(--dim); }
+  label.check { display:flex; align-items:center; gap:.5rem; color:var(--text); }
+  input, select { font:inherit; padding:.45rem .55rem; border-radius:6px; border:1px solid var(--line); background:#0f1317; color:var(--text); }
+  .two { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:.7rem; }
+  .tabs { display:flex; gap:.4rem; margin-bottom:.6rem; }
+  .tabs button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .pager { display:flex; gap:.4rem; align-items:center; justify-content:center; flex-wrap:wrap; margin-top:.7rem; }
+  .pager select { max-width:16rem; }
+  .pager .count { font-size:.78rem; color:var(--dim); width:100%; text-align:center; }
+  pre { background:#0b0e11; border-radius:8px; padding:.7rem; max-height:320px; overflow:auto; font-size:.72rem; white-space:pre-wrap; }
+  dialog { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:12px; width:min(960px, 96vw); padding:1rem; }
+  dialog::backdrop { background:rgba(0,0,0,.7); }
+  .hint { font-size:.78rem; color:var(--dim); line-height:1.5; }
+  #toast { position:fixed; left:50%; bottom:1rem; transform:translateX(-50%); background:#000c; padding:.6rem 1rem; border-radius:8px; display:none; z-index:5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>XIAO ドラレコ</h1>
+  <span id="bRec" class="badge">録画 --</span>
+  <span id="bSd" class="badge">SD --</span>
+  <span id="bNet" class="badge">Wi-Fi --</span>
+  <span id="bUsb" class="badge">USB --</span>
+</header>
+<main>
+  <section>
+    <h2>ライブ映像</h2>
+    <img id="live" class="live" alt="">
+    <div class="row">
+      <button id="liveBtn">ライブ停止</button>
+      <button id="recBtn" class="primary">録画停止</button>
+      <button id="protectBtn">今の映像を保護</button>
+      <button onclick="window.open('/snapshot.jpg')">静止画</button>
+    </div>
+    <div id="recErr" class="err"></div>
+  </section>
+
+  <section>
+    <h2>状態</h2>
+    <div class="grid" id="status"></div>
+  </section>
+
+  <section>
+    <h2>録画ファイル</h2>
+    <div class="tabs">
+      <button id="tabAll" class="on">すべて</button>
+      <button id="tabLock">保護のみ</button>
+      <button id="refreshFiles">更新</button>
+    </div>
+    <table><tbody id="files"></tbody></table>
+    <div class="pager" id="pager">
+      <button data-page="first" aria-label="最初のページ">«</button>
+      <button data-page="prev" aria-label="前のページ">‹</button>
+      <select id="pageSel" aria-label="ページ"></select>
+      <button data-page="next" aria-label="次のページ">›</button>
+      <button data-page="last" aria-label="最後のページ">»</button>
+      <select id="perPage" aria-label="1ページの件数">
+        <option value="5">5件</option><option value="10">10件</option><option value="20">20件</option><option value="50">50件</option>
+      </select>
+      <div class="count" id="fileCount"></div>
+    </div>
+    <p class="hint">AVI（MJPEG）形式です。PC では VLC などで再生できます。「再生」はブラウザ内で再生します（音声なし）。</p>
+  </section>
+
+  <section>
+    <h2>カメラ・録画設定</h2>
+    <form id="camForm">
+      <div class="two">
+        <label>解像度<select name="framesize" id="framesize"></select></label>
+        <label>録画フレームレート上限 (fps)<input name="fps_limit" type="number" min="1" max="30"></label>
+        <label>JPEG 画質 (4=高画質〜63=低画質)<input name="jpeg_quality" type="number" min="4" max="63"></label>
+        <label>1ファイルの長さ (秒)<input name="segment_sec" type="number" min="15" max="900"></label>
+        <label>空き容量の下限 (%) ※下回ると古い録画から削除<input name="min_free_pct" type="number" min="2" max="50"></label>
+        <label>タイムゾーン (POSIX TZ)<input name="tz"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="vflip"> 上下反転</label>
+      <label class="check"><input type="checkbox" name="hmirror"> 左右反転</label>
+      <label class="check"><input type="checkbox" name="auto_record"> 起動時に自動で録画開始</label>
+      <div><button class="primary">保存</button></div>
+      <p class="hint">USB Webカメラ(UVC)は 1280x720 として認識されます。解像度を HD 以外にすると、PC 側アプリによっては映らないことがあります。</p>
+    </form>
+  </section>
+
+  <section>
+    <h2>ネットワーク</h2>
+    <form id="netForm">
+      <div class="two">
+        <label>接続する Wi-Fi の SSID（空欄で無効）<input name="sta_ssid" autocomplete="off"></label>
+        <label>Wi-Fi パスワード<input name="sta_pass" type="password" autocomplete="new-password" placeholder="変更しない場合は空欄"></label>
+        <label>本体アクセスポイント SSID<input name="ap_ssid"></label>
+        <label>アクセスポイント パスワード（8文字以上）<input name="ap_pass" type="password" autocomplete="new-password" placeholder="変更しない場合は空欄"></label>
+        <label>ホスト名（http://名前.local）<input name="hostname" pattern="[a-z0-9-]+"></label>
+      </div>
+      <div><button class="primary">保存して再起動</button></div>
+      <p class="hint">同じ Wi-Fi 内からは <b id="mdnsName">http://dashcam.local</b> で、本体のアクセスポイントに接続した場合は http://192.168.4.1 またはどのホスト名でも開けます。</p>
+    </form>
+  </section>
+
+  <section>
+    <h2>メンテナンス</h2>
+    <div class="row">
+      <label style="flex:1">ファームウェア更新 (.bin)<input type="file" id="otaFile" accept=".bin"></label>
+    </div>
+    <div class="row">
+      <button id="otaBtn" class="primary">更新を書き込む</button>
+      <button id="rebootBtn">再起動</button>
+      <button id="maintBtn">USB書き込みモードで再起動</button>
+      <button id="formatBtn" class="danger">SDカードをフォーマット</button>
+      <button id="logBtn">ログ表示</button>
+    </div>
+    <p class="hint">「USB書き込みモード」では次の1回だけ USB Webカメラを無効にして起動し、USB 経由の書き込み・ログ表示ができます。本体の BOOT ボタンを 3 秒長押ししても切り替わります。</p>
+    <pre id="log" hidden></pre>
+  </section>
+</main>
+
+<dialog id="player">
+  <div class="row" style="margin:0 0 .6rem; align-items:center">
+    <strong id="playerTitle" style="margin-right:auto; font-size:.9rem"></strong>
+    <select id="speed"><option value="1">1x</option><option value="2">2x</option><option value="4">4x</option><option value="8">8x</option></select>
+    <button id="closePlayer">閉じる</button>
+  </div>
+  <img id="playerImg" class="live" alt="">
+</dialog>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let status = null, files = [], onlyLocked = false, liveOn = true, playing = null, page = 0;
+
+function toast(msg) { const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3500); }
+function bytes(n) { if (n == null) return '-'; const u = ['B','KB','MB','GB','TB']; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + u[i]; }
+function uptime(s) { const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h + '時間' + m + '分'; }
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) throw new Error(j.message || r.statusText);
+  return j;
+}
+
+function setLive(on) {
+  liveOn = on;
+  $('live').src = on ? '/stream?t=' + Date.now() : '';
+  $('liveBtn').textContent = on ? 'ライブ停止' : 'ライブ開始';
+}
+
+function kv(k, v) { return `<div class="kv"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
+
+function renderStatus(s) {
+  const r = s.rec, sd = s.sd, n = s.net, u = s.usb;
+  $('bRec').textContent = r.recording ? '● 録画中' : (r.enabled ? '録画待機' : '録画停止');
+  $('bRec').className = 'badge' + (r.recording ? ' rec' : (r.enabled ? ' warn' : ''));
+  $('bSd').textContent = sd.mounted ? 'SD 空き ' + bytes(sd.free) : 'SD なし';
+  $('bSd').className = 'badge' + (sd.mounted ? ' ok' : ' warn');
+  $('bNet').textContent = n.sta_connected ? 'Wi-Fi ' + n.sta_ssid : 'AP ' + n.ap_ssid;
+  $('bNet').className = 'badge' + (n.sta_connected ? ' ok' : '');
+  $('bUsb').textContent = u.maintenance ? 'USB 書き込みモード' : (u.streaming ? 'USB 配信中' : (u.uvc ? 'USB Webカメラ' : 'USB -'));
+  $('bUsb').className = 'badge' + (u.maintenance ? ' warn' : (u.streaming ? ' ok' : ''));
+  $('recBtn').textContent = r.enabled ? '録画停止' : '録画開始';
+  $('recErr').textContent = r.error || '';
+  $('mdnsName').textContent = 'http://' + n.hostname + '.local';
+  const t = s.time_valid ? new Date(s.time * 1000).toLocaleString('ja-JP') : '未設定';
+  $('status').innerHTML = [
+    kv('時刻', t + (n.time_synced ? '' : ' (未同期)')),
+    kv('カメラ', `${s.camera.ok ? s.camera.sensor : 'エラー'} / ${s.camera.fps.toFixed(1)} fps`),
+    kv('録画ファイル', r.file ? `${r.file}<br>${bytes(r.bytes)} / ${r.fps.toFixed(1)} fps` : '-'),
+    kv('SD カード', sd.mounted ? `${bytes(sd.free)} 空き / ${bytes(sd.total)}` : sd.status),
+    kv('ループ録画で削除', r.deleted + ' 件'),
+    kv('Wi-Fi', n.sta_configured ? (n.sta_connected ? `${n.sta_ssid}<br>${n.sta_ip} (${n.sta_rssi} dBm)` : `${n.sta_ssid} に接続中…`) : '未設定'),
+    kv('アクセスポイント', `${n.ap_ssid}${n.ap_open ? ' (パスワードなし)' : ''}<br>${n.ap_ip} / ${n.ap_clients} 台接続`),
+    kv('USB', u.maintenance ? '書き込みモード (シリアル)' : (u.uvc ? (u.streaming ? 'Webカメラとして配信中' : 'Webカメラ待機') : '無効')),
+    kv('稼働時間', uptime(s.uptime_s)),
+    kv('メモリ空き', `内部 ${bytes(s.heap.internal)} / PSRAM ${bytes(s.heap.psram)}`),
+    kv('バージョン', s.version),
+  ].join('');
+}
+
+async function refreshStatus() {
+  try {
+    status = await api('/api/status');
+    renderStatus(status);
+    if (!status.net.time_synced && !refreshStatus.timeSent) {
+      refreshStatus.timeSent = true;
+      api('/api/time', { epoch_ms: Date.now() }).catch(() => {});
+    }
+  } catch (e) { $('bRec').textContent = '接続できません'; $('bRec').className = 'badge warn'; }
+}
+
+function fileLabel(name) {
+  const m = name.match(/^(\d+)_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+  return m ? `${m[2]}/${m[3]}/${m[4]} ${m[5]}:${m[6]}:${m[7]}` : name;
+}
+
+function shortLabel(name) {
+  const m = name.match(/^\d+_\d{4}(\d{2})(\d{2})_(\d{2})(\d{2})/);
+  return m ? `${m[1]}/${m[2]} ${m[3]}:${m[4]}` : name.replace(/\.avi$/, '');
+}
+
+function renderPager(list, pages) {
+  const per = perPage();
+  const opts = [];
+  for (let p = 0; p < pages; p++) {
+    const first = list[p * per], last = list[Math.min(list.length, (p + 1) * per) - 1];
+    const from = shortLabel(last.n), to = shortLabel(first.n);
+    const range = from.slice(0, 5) === to.slice(0, 5) && from.length === 11 && to.length === 11
+      ? `${from}〜${to.slice(6)}` : `${from}〜${to}`;
+    opts.push(`<option value="${p}">${p + 1}/${pages}  ${range}</option>`);
+  }
+  $('pageSel').innerHTML = opts.join('');
+  $('pageSel').value = page;
+  const at = (k) => $('pager').querySelector(`[data-page="${k}"]`);
+  at('first').disabled = at('prev').disabled = page === 0;
+  at('next').disabled = at('last').disabled = page >= pages - 1;
+  $('fileCount').textContent = list.length
+    ? `${list.length} 件中 ${page * per + 1}〜${Math.min(list.length, (page + 1) * per)} 件目（新しい順）` : '';
+  $('pager').style.display = list.length ? '' : 'none';
+}
+
+function perPage() { return Number($('perPage').value) || 10; }
+
+function renderFiles() {
+  const list = files.filter(f => !onlyLocked || f.d === 'LOCK').sort((a, b) => b.n.localeCompare(a.n));
+  const current = status && status.rec.recording ? status.rec.file : '';
+  const per = perPage();
+  const pages = Math.max(1, Math.ceil(list.length / per));
+  page = Math.min(Math.max(page, 0), pages - 1);
+  renderPager(list, pages);
+  $('files').innerHTML = list.length ? list.slice(page * per, (page + 1) * per).map(f => `
+    <tr><td>${fileLabel(f.n)}${f.d === 'LOCK' ? '<span class="lock">保護</span>' : ''}${f.n === current ? '<span class="lock">録画中</span>' : ''}
+      <div class="hint">${f.n} / ${bytes(f.s)}</div></td>
+    <td class="actions">
+      <button class="small" data-act="play" data-d="${f.d}" data-n="${f.n}">再生</button>
+      <a href="/files/${f.d}/${f.n}" download><button class="small">保存</button></a>
+      <button class="small" data-act="${f.d === 'LOCK' ? 'unlock' : 'lock'}" data-d="${f.d}" data-n="${f.n}">${f.d === 'LOCK' ? '保護解除' : '保護'}</button>
+      <button class="small danger" data-act="delete" data-d="${f.d}" data-n="${f.n}">削除</button>
+    </td></tr>`).join('') : '<tr><td class="hint">ファイルがありません</td></tr>';
+}
+
+async function refreshFiles() {
+  try { const j = await api('/api/files'); files = j.files || []; renderFiles(); } catch (e) { toast('一覧の取得に失敗: ' + e.message); }
+}
+
+$('files').addEventListener('click', async (ev) => {
+  const b = ev.target.closest('button[data-act]'); if (!b) return;
+  const { act, d, n } = b.dataset;
+  if (act === 'play') return openPlayer(d, n);
+  if (act === 'delete' && !confirm(n + ' を削除しますか？')) return;
+  try { await api('/api/file', { action: act, dir: d, name: n }); refreshFiles(); } catch (e) { toast(e.message); }
+});
+
+function openPlayer(d, n) {
+  playing = { d, n };
+  if (liveOn) setLive(false);
+  $('playerTitle').textContent = fileLabel(n);
+  $('playerImg').src = `/play/${d}/${n}?speed=${$('speed').value}&t=${Date.now()}`;
+  $('player').showModal();
+}
+$('speed').onchange = () => playing && openPlayer(playing.d, playing.n);
+$('closePlayer').onclick = () => $('player').close();
+$('player').addEventListener('close', () => { $('playerImg').src = ''; playing = null; setLive(true); });
+
+$('liveBtn').onclick = () => setLive(!liveOn);
+$('recBtn').onclick = async () => { try { await api('/api/record', { enabled: !status.rec.enabled }); refreshStatus(); } catch (e) { toast(e.message); } };
+$('protectBtn').onclick = async () => { try { const j = await api('/api/protect', {}); toast(j.message); setTimeout(refreshFiles, 1500); } catch (e) { toast(e.message); } };
+$('tabAll').onclick = () => { onlyLocked = false; page = 0; $('tabAll').classList.add('on'); $('tabLock').classList.remove('on'); renderFiles(); };
+$('tabLock').onclick = () => { onlyLocked = true; page = 0; $('tabLock').classList.add('on'); $('tabAll').classList.remove('on'); renderFiles(); };
+$('pager').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-page]'); if (!b) return;
+  const k = b.dataset.page;
+  page = k === 'first' ? 0 : k === 'prev' ? page - 1 : k === 'next' ? page + 1 : Infinity;
+  renderFiles();
+});
+$('pageSel').onchange = () => { page = Number($('pageSel').value); renderFiles(); };
+$('perPage').value = localStorage.getItem('perPage') || '10';
+$('perPage').onchange = () => {
+  const firstShown = page * Number(localStorage.getItem('perPage') || 10);
+  localStorage.setItem('perPage', $('perPage').value);
+  page = Math.floor(firstShown / perPage());
+  renderFiles();
+};
+$('refreshFiles').onclick = refreshFiles;
+
+async function loadSettings() {
+  const s = await api('/api/settings');
+  $('framesize').innerHTML = s.framesizes.map(f => `<option value="${f.value}">${f.label}</option>`).join('');
+  for (const form of [$('camForm'), $('netForm')]) {
+    for (const el of form.elements) {
+      if (!el.name || !(el.name in s)) continue;
+      if (el.type === 'checkbox') el.checked = s[el.name]; else el.value = s[el.name];
+    }
+  }
+  $('netForm').sta_pass.placeholder = s.sta_pass_set ? '設定済み（変更しない場合は空欄）' : '未設定';
+  $('netForm').ap_pass.placeholder = s.ap_pass_set ? '設定済み（変更しない場合は空欄）' : '未設定（パスワードなし）';
+}
+
+$('camForm').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target, body = {};
+  for (const el of f.elements) {
+    if (!el.name) continue;
+    body[el.name] = el.type === 'checkbox' ? el.checked : (el.type === 'number' || el.tagName === 'SELECT' ? Number(el.value) : el.value);
+  }
+  try { await api('/api/settings', body); toast('保存しました'); } catch (e) { toast(e.message); }
+};
+
+$('netForm').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const f = ev.target, body = { sta_ssid: f.sta_ssid.value, ap_ssid: f.ap_ssid.value, hostname: f.hostname.value };
+  if (f.sta_pass.value) body.sta_pass = f.sta_pass.value;
+  if (!f.sta_ssid.value) body.sta_pass = '';
+  if (f.ap_pass.value) body.ap_pass = f.ap_pass.value;
+  if (!confirm('保存して再起動します。よろしいですか？')) return;
+  try { const j = await api('/api/settings', body); toast(j.reboot ? '再起動します。新しい設定で接続し直してください' : '保存しました'); } catch (e) { toast(e.message); }
+};
+
+$('otaBtn').onclick = async () => {
+  const file = $('otaFile').files[0]; if (!file) return toast('.bin ファイルを選んでください');
+  if (!confirm(file.name + ' を書き込みます。録画はいったん止まります。')) return;
+  $('otaBtn').disabled = true; toast('書き込み中…');
+  try {
+    const r = await fetch('/api/ota', { method: 'POST', headers: {'Content-Type': 'application/octet-stream'}, body: file });
+    const j = await r.json(); toast(j.message || (r.ok ? '完了' : '失敗'));
+  } catch (e) { toast('失敗: ' + e.message); }
+  $('otaBtn').disabled = false;
+};
+$('rebootBtn').onclick = async () => { if (confirm('再起動しますか？')) { try { toast((await api('/api/reboot', { mode: 'normal' })).message); } catch (e) { toast(e.message); } } };
+$('maintBtn').onclick = async () => { if (confirm('USB Webカメラを止めて、USB書き込みモードで再起動しますか？')) { try { toast((await api('/api/reboot', { mode: 'maintenance' })).message); } catch (e) { toast(e.message); } } };
+$('formatBtn').onclick = async () => {
+  const c = prompt('SDカードの全データ（保護ファイル含む）を消去します。実行するには FORMAT と入力してください');
+  if (c !== 'FORMAT') return;
+  toast('フォーマット中…（大容量カードは時間がかかります）');
+  try { toast((await api('/api/format', { confirm: 'FORMAT' })).message); refreshFiles(); } catch (e) { toast(e.message); }
+};
+$('logBtn').onclick = async () => {
+  const pre = $('log'); pre.hidden = false;
+  pre.textContent = await (await fetch('/api/log')).text(); pre.scrollTop = pre.scrollHeight;
+};
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (liveOn) { $('live').src = ''; } }
+  else if (liveOn && !playing) setLive(true);
+});
+
+setLive(true);
+refreshStatus().then(refreshFiles);
+loadSettings().catch(e => toast('設定の取得に失敗: ' + e.message));
+setInterval(refreshStatus, 3000);
+setInterval(refreshFiles, 30000);
+</script>
+</body>
+</html>

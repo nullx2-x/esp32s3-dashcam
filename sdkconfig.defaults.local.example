@@ -1,0 +1,5 @@
+# Copy to sdkconfig.defaults.local (git-ignored) and fill in.
+# These are only first-boot defaults; the web UI can change them later.
+CONFIG_DASHCAM_WIFI_SSID="your-ssid"
+CONFIG_DASHCAM_WIFI_PASSWORD="your-wifi-password"
+CONFIG_DASHCAM_AP_PASSWORD="at-least-8-chars"

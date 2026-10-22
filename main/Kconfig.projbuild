@@ -1,0 +1,31 @@
+menu "Dashcam"
+
+    config DASHCAM_HOSTNAME
+        string "Hostname (mDNS name without .local)"
+        default "dashcam"
+
+    config DASHCAM_AP_PASSWORD
+        string "Initial access point password"
+        default ""
+        help
+            WPA2 password (8+ characters) used for the device's own access point
+            until it is changed from the web UI. Empty or shorter values make the
+            access point open.
+
+    config DASHCAM_WIFI_SSID
+        string "Initial Wi-Fi SSID to join"
+        default ""
+
+    config DASHCAM_WIFI_PASSWORD
+        string "Initial Wi-Fi password"
+        default ""
+
+    config DASHCAM_ENABLE_UVC
+        bool "Expose the camera as a USB webcam (UVC)"
+        default y
+        help
+            When enabled, the USB port becomes a UVC webcam and the built-in
+            USB-Serial/JTAG port disappears. Use the web UI "maintenance reboot",
+            hold the BOOT button for 3 seconds, or use OTA to update firmware.
+
+endmenu
