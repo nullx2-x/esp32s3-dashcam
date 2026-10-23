@@ -20,6 +20,17 @@ Seeed XIAO ESP32S3 Sense (OV3660) + microSD をループ録画のドラレコに
 
 API: `/stream` (MJPEG), `/snapshot.jpg`, `/api/status`, `/api/settings`, `/api/files`, `/files/<dir>/<name>`, `/play/<dir>/<name>?speed=N` ほか。
 
+## 見た目のカスタマイズ (SD カード)
+
+SD カードの `www/` に置いたファイルが `/assets/<パス>` で配信される。`www/custom.css` があれば Web UI が自動で読み込むので、
+CSS 変数 (`--bg`, `--card`, `--text`, `--accent` など) を上書きするだけで配色を変えられる。例: [`examples/www/custom.css`](examples/www/custom.css) (ライトテーマ)。
+
+- Web UI の「見た目のカスタマイズ」からアップロード・削除できる (SD を抜いて PC で `www/` に置いてもよい)
+- 配信するのは CSS・画像 (png/jpg/gif/webp/svg/ico)・フォント (woff/woff2/ttf/otf) だけ。HTML と JavaScript はファームウェアに埋め込んだものだけを使う
+- 1 ファイル 2MB まで、パスは英数字と `_ - .`、フォルダは 2 階層まで。`www/favicon.ico` はファビコンになる
+- UI ページには CSP を付けているので、custom.css から外部サイトの画像やフォントは読めない
+- 表示が崩れたら `http://dashcam.local/?nocss` で custom.css なしで開ける
+
 ## ビルド
 
 ESP-IDF v5.4 以降 (v5.5.4 で確認) が必要。
@@ -52,6 +63,8 @@ AP パスワードを空にすると AP は暗号化なしになるので、8 �
 - SD は SDMMC 1bit 40MHz で接続し、失敗時は SPI にフォールバック (約 12fps 上限)。
   SPI モードに入ったカードは電源を切るまで SD モードに戻らない
 - UVC の解像度はビルド時固定 (1280x720)
+- カメラが応答しなくなると、自動で再初期化を繰り返す (5 秒〜60 秒間隔)。カメラには電源・リセット線がないため、
+  ログに `SCCB bus not idle (SDA=0 SCL=0)` が出続ける場合はカメラ側の電源が落ちている。拡張ボードとカメラのコネクタを確認して USB を挿し直す
 - 音声・GPS・G センサーなし
 - Web UI に認証なし。AP は WPA2 だが、自宅 LAN 内からは誰でも操作できる
 

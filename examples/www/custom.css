@@ -1,0 +1,12 @@
+/* Light theme. Upload from the web UI ("見た目のカスタマイズ") or copy to the SD card as www/custom.css. */
+:root {
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --line: #d8dee6;
+  --text: #1b2027;
+  --dim: #5b6675;
+  --accent: #0b6bcb;
+}
+button { background: #eef1f5; }
+input, select { background: #ffffff; }
+.kv, pre, code { background: #f0f3f7; }

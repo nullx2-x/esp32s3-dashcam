@@ -45,7 +45,15 @@
   dialog::backdrop { background:rgba(0,0,0,.7); }
   .hint { font-size:.78rem; color:var(--dim); line-height:1.5; }
   #toast { position:fixed; left:50%; bottom:1rem; transform:translateX(-50%); background:#000c; padding:.6rem 1rem; border-radius:8px; display:none; z-index:5; }
+  code { font-size:.85em; background:#0b0e11; padding:.05rem .3rem; border-radius:4px; }
 </style>
+<script>
+  if (!new URLSearchParams(location.search).has('nocss')) {
+    const link = document.createElement('link');
+    link.rel = 'stylesheet'; link.id = 'customCss'; link.href = '/assets/custom.css';
+    document.head.append(link);
+  }
+</script>
 </head>
 <body>
 <header>
@@ -130,6 +138,23 @@
   </section>
 
   <section>
+    <h2>見た目のカスタマイズ（SD カード）</h2>
+    <table><tbody id="assets"></tbody></table>
+    <div class="row">
+      <label style="flex:2">アップロードするファイル<input type="file" id="assetFiles" multiple accept=".css,.png,.jpg,.jpeg,.gif,.webp,.svg,.ico,.woff,.woff2,.ttf,.otf"></label>
+      <label style="flex:1">保存先フォルダ（任意）<input id="assetDir" placeholder="例: img"></label>
+    </div>
+    <div class="row">
+      <button id="assetUpload" class="primary">アップロード</button>
+      <button id="assetRefresh">更新</button>
+    </div>
+    <p class="hint">SD カードの <code>www</code> フォルダに保存され、<code>/assets/ファイル名</code> で参照できます。
+      <b>custom.css</b> を置くと自動で読み込まれます（例: <code>:root { --accent: #e5484d; }</code>、画像は <code>url(/assets/img/bg.jpg)</code>）。
+      対応形式は CSS・画像・フォント（1 ファイル 2MB まで、ファイル名は英数字と <code>_ - .</code>）。
+      表示が崩れたときは <a href="/?nocss">/?nocss</a> で開くと custom.css なしで表示されます。</p>
+  </section>
+
+  <section>
     <h2>メンテナンス</h2>
     <div class="row">
       <label style="flex:1">ファームウェア更新 (.bin)<input type="file" id="otaFile" accept=".bin"></label>
@@ -190,7 +215,7 @@ function renderStatus(s) {
   $('bUsb').textContent = u.maintenance ? 'USB 書き込みモード' : (u.streaming ? 'USB 配信中' : (u.uvc ? 'USB Webカメラ' : 'USB -'));
   $('bUsb').className = 'badge' + (u.maintenance ? ' warn' : (u.streaming ? ' ok' : ''));
   $('recBtn').textContent = r.enabled ? '録画停止' : '録画開始';
-  $('recErr').textContent = r.error || '';
+  $('recErr').textContent = r.error || (s.camera.ok ? '' : 'カメラが応答しません。自動で再接続を試しています');
   $('mdnsName').textContent = 'http://' + n.hostname + '.local';
   const t = s.time_valid ? new Date(s.time * 1000).toLocaleString('ja-JP') : '未設定';
   $('status').innerHTML = [
@@ -369,13 +394,65 @@ $('logBtn').onclick = async () => {
   pre.textContent = await (await fetch('/api/log')).text(); pre.scrollTop = pre.scrollHeight;
 };
 
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function reloadCustomCss() {
+  const link = $('customCss');
+  if (link) link.href = '/assets/custom.css?v=' + Date.now();
+}
+
+async function refreshAssets() {
+  try {
+    const j = await api('/api/assets');
+    const list = (j.files || []).sort((a, b) => a.p.localeCompare(b.p));
+    $('assets').innerHTML = !j.mounted ? '<tr><td class="hint">SD カードがありません</td></tr>'
+      : !list.length ? '<tr><td class="hint">まだファイルがありません</td></tr>'
+      : list.map(f => `
+        <tr><td>${f.served ? `<a href="/assets/${esc(f.p)}" target="_blank" rel="noopener">${esc(f.p)}</a>` : esc(f.p)}${f.p === 'custom.css' ? '<span class="lock">自動で読み込み</span>' : ''}
+          <div class="hint">${bytes(f.s)}${f.served ? '' : ' / 配信されない形式'}</div></td>
+        <td class="actions"><button class="small danger" data-asset="${esc(f.p)}">削除</button></td></tr>`).join('');
+  } catch (e) { toast('一覧の取得に失敗: ' + e.message); }
+}
+
+$('assets').addEventListener('click', async (ev) => {
+  const b = ev.target.closest('button[data-asset]'); if (!b) return;
+  const path = b.dataset.asset;
+  if (!confirm(path + ' を削除しますか？')) return;
+  try { await api('/api/assets/delete', { path }); reloadCustomCss(); refreshAssets(); } catch (e) { toast(e.message); }
+});
+
+$('assetUpload').onclick = async () => {
+  const list = [...$('assetFiles').files];
+  if (!list.length) return toast('ファイルを選んでください');
+  const dir = $('assetDir').value.trim().replace(/^\/+|\/+$/g, '');
+  const paths = list.map(f => (dir ? dir + '/' : '') + f.name);
+  const bad = paths.find(p => !/^[A-Za-z0-9_.\-\/]+$/.test(p));
+  if (bad) return toast(`${bad}: ファイル名とフォルダ名は英数字と _ - . だけにしてください`);
+  $('assetUpload').disabled = true;
+  try {
+    for (const [i, file] of list.entries()) {
+      toast(`アップロード中 (${i + 1}/${list.length}) ${paths[i]}`);
+      const r = await fetch('/api/assets/upload', {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Asset-Path': paths[i] }, body: file });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.ok === false) throw new Error(`${paths[i]}: ${j.message || r.statusText}`);
+    }
+    toast('アップロードしました');
+    $('assetFiles').value = '';
+    reloadCustomCss();
+  } catch (e) { toast(e.message); }
+  $('assetUpload').disabled = false;
+  refreshAssets();
+};
+$('assetRefresh').onclick = refreshAssets;
+
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { if (liveOn) { $('live').src = ''; } }
   else if (liveOn && !playing) setLive(true);
 });
 
 setLive(true);
-refreshStatus().then(refreshFiles);
+refreshStatus().then(refreshFiles).then(refreshAssets);
 loadSettings().catch(e => toast('設定の取得に失敗: ' + e.message));
 setInterval(refreshStatus, 3000);
 setInterval(refreshFiles, 30000);

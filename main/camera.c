@@ -3,9 +3,11 @@
 #include <string.h>
 
 #include "board.h"
+#include "driver/gpio.h"
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -15,6 +17,9 @@
 #define HUB_SLOTS          8
 #define SLOT_INITIAL_CAP   (192 * 1024)
 #define EV_NEW_FRAME       BIT0
+#define STALL_TIMEOUT_US   (10 * 1000000LL)
+#define RETRY_MIN_MS       5000
+#define RETRY_MAX_MS       60000
 
 static const char *TAG = "camera";
 
@@ -28,7 +33,9 @@ static dashcam_settings_t s_pending;
 static volatile bool s_pending_valid;
 static portMUX_TYPE s_pending_lock = portMUX_INITIALIZER_UNLOCKED;
 
-static bool s_ok;
+static camera_config_t s_config;
+static dashcam_settings_t s_settings;
+static volatile bool s_ok;
 static float s_fps;
 static const char *s_sensor_name = "none";
 
@@ -42,6 +49,54 @@ static void apply_sensor_settings(const dashcam_settings_t *st)
     s->set_hmirror(s, st->hmirror);
     ESP_LOGI(TAG, "framesize=%d quality=%d vflip=%d hmirror=%d",
              st->framesize, st->jpeg_quality, st->vflip, st->hmirror);
+}
+
+/* The sensor has no power or reset line on this board, so it survives an ESP32 reset. If that
+ * reset landed mid-transfer the sensor may still hold SDA low; clocking SCL releases it. */
+static void sccb_bus_recover(void)
+{
+    const gpio_config_t io = {
+        .pin_bit_mask = BIT64(CAM_PIN_SIOD) | BIT64(CAM_PIN_SIOC),
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(CAM_PIN_SIOD, 1);
+    gpio_set_level(CAM_PIN_SIOC, 1);
+    esp_rom_delay_us(20);
+    const int sda = gpio_get_level(CAM_PIN_SIOD), scl = gpio_get_level(CAM_PIN_SIOC);
+    if (!sda || !scl) ESP_LOGW(TAG, "SCCB bus not idle (SDA=%d SCL=%d), clocking it free", sda, scl);
+    for (int i = 0; i < 9 && !gpio_get_level(CAM_PIN_SIOD); i++) {
+        gpio_set_level(CAM_PIN_SIOC, 0);
+        esp_rom_delay_us(10);
+        gpio_set_level(CAM_PIN_SIOC, 1);
+        esp_rom_delay_us(10);
+    }
+    /* STOP condition */
+    gpio_set_level(CAM_PIN_SIOD, 0);
+    esp_rom_delay_us(10);
+    gpio_set_level(CAM_PIN_SIOD, 1);
+    esp_rom_delay_us(10);
+    gpio_reset_pin(CAM_PIN_SIOD);
+    gpio_reset_pin(CAM_PIN_SIOC);
+}
+
+static esp_err_t init_sensor(void)
+{
+    sccb_bus_recover();
+    esp_err_t err = esp_camera_init(&s_config);
+    if (err != ESP_OK) {
+        esp_camera_deinit();
+        return err;
+    }
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        camera_sensor_info_t *info = esp_camera_sensor_get_info(&s->id);
+        if (info) s_sensor_name = info->name;
+        ESP_LOGI(TAG, "sensor %s (PID 0x%04x)", s_sensor_name, s->id.PID);
+    }
+    apply_sensor_settings(&s_settings);
+    return ESP_OK;
 }
 
 static frame_t *claim_slot(size_t need)
@@ -90,26 +145,48 @@ static void publish(frame_t *f)
 static void camera_task(void *arg)
 {
     int64_t fps_window_start = esp_timer_get_time();
+    int64_t last_frame = fps_window_start;
     int fps_frames = 0;
-    int failures = 0;
+    uint32_t retry_ms = RETRY_MIN_MS;
 
     for (;;) {
         if (s_pending_valid) {
-            dashcam_settings_t st;
             portENTER_CRITICAL(&s_pending_lock);
-            st = s_pending;
+            s_settings = s_pending;
             s_pending_valid = false;
             portEXIT_CRITICAL(&s_pending_lock);
-            apply_sensor_settings(&st);
+            if (s_ok) apply_sensor_settings(&s_settings);
+        }
+
+        if (!s_ok) {
+            vTaskDelay(pdMS_TO_TICKS(retry_ms));
+            esp_err_t err = init_sensor();
+            if (err != ESP_OK) {
+                retry_ms = retry_ms * 2 > RETRY_MAX_MS ? RETRY_MAX_MS : retry_ms * 2;
+                ESP_LOGE(TAG, "camera still unavailable (%s), next try in %lu s", esp_err_to_name(err),
+                         (unsigned long)retry_ms / 1000);
+                continue;
+            }
+            ESP_LOGW(TAG, "camera recovered");
+            retry_ms = RETRY_MIN_MS;
+            last_frame = fps_window_start = esp_timer_get_time();
+            fps_frames = 0;
+            s_ok = true;
         }
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            if (++failures % 20 == 1) ESP_LOGW(TAG, "frame capture failed (%d)", failures);
-            vTaskDelay(pdMS_TO_TICKS(20));
+            if (esp_timer_get_time() - last_frame > STALL_TIMEOUT_US) {
+                ESP_LOGE(TAG, "no frames for %lld s, restarting camera", STALL_TIMEOUT_US / 1000000);
+                s_ok = false;
+                s_fps = 0;
+                esp_camera_deinit();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
             continue;
         }
-        failures = 0;
+        last_frame = esp_timer_get_time();
 
         frame_t *slot = claim_slot(fb->len);
         if (slot) {
@@ -138,7 +215,7 @@ esp_err_t camera_start(const dashcam_settings_t *settings)
     s_events = xEventGroupCreate();
     if (!s_lock || !s_events) return ESP_ERR_NO_MEM;
 
-    const camera_config_t config = {
+    s_config = (camera_config_t){
         .pin_pwdn = CAM_PIN_PWDN,
         .pin_reset = CAM_PIN_RESET,
         .pin_xclk = CAM_PIN_XCLK,
@@ -167,25 +244,16 @@ esp_err_t camera_start(const dashcam_settings_t *settings)
         .grab_mode = CAMERA_GRAB_LATEST,
     };
 
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "camera init failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    s_settings = *settings;
 
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        camera_sensor_info_t *info = esp_camera_sensor_get_info(&s->id);
-        if (info) s_sensor_name = info->name;
-        ESP_LOGI(TAG, "sensor %s (PID 0x%04x)", s_sensor_name, s->id.PID);
-    }
-    apply_sensor_settings(settings);
-    s_ok = true;
+    esp_err_t err = init_sensor();
+    if (err != ESP_OK) ESP_LOGE(TAG, "camera init failed: %s; retrying in the background", esp_err_to_name(err));
+    s_ok = err == ESP_OK;
 
     if (xTaskCreatePinnedToCore(camera_task, "camera", 4096, NULL, 6, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    return ESP_OK;
+    return err;
 }
 
 void camera_apply_settings(const dashcam_settings_t *settings)

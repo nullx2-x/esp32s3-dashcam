@@ -20,6 +20,7 @@
 #define MIN_FREE_FLOOR_BYTES (256ULL * 1024 * 1024)
 #define SYNC_INTERVAL_US     (3 * 1000000LL)
 #define REMOUNT_INTERVAL_US  (10 * 1000000LL)
+#define FRAME_GAP_CLOSE_US   (5 * 1000000LL)
 
 static const char *TAG = "recorder";
 
@@ -151,7 +152,7 @@ static void recorder_task(void *arg)
     avi_writer_t *w = NULL;
     char name[64] = "";
     uint16_t seg_w = 0, seg_h = 0;
-    int64_t seg_start = 0, last_sync = 0, next_due = 0, last_mount_try = -REMOUNT_INTERVAL_US;
+    int64_t seg_start = 0, last_sync = 0, next_due = 0, last_frame = 0, last_mount_try = -REMOUNT_INTERVAL_US;
     int64_t fps_window = esp_timer_get_time();
     uint32_t fps_frames = 0;
     uint32_t last_seq = 0;
@@ -189,7 +190,14 @@ static void recorder_task(void *arg)
         }
 
         frame_t *f = camera_acquire(&last_seq, 1000);
-        if (!f) continue;
+        if (!f) {
+            if (w && esp_timer_get_time() - last_frame > FRAME_GAP_CLOSE_US) {
+                ESP_LOGW(TAG, "no camera frames, closing %s", name);
+                finish_segment(&w, name, false);
+            }
+            continue;
+        }
+        last_frame = f->timestamp_us;
 
         /* Pace against a schedule rather than the previous frame, otherwise a camera
          * running slightly faster than the limit gets every other frame dropped. */

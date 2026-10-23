@@ -1,10 +1,12 @@
 #include "web.h"
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -37,6 +39,15 @@
 #define PLAY_BUF_SIZE   (640 * 1024)
 #define LIST_BUF_SIZE   4096
 
+#define ASSET_DIR       SD_MOUNT_POINT "/www"
+#define ASSET_MAX_PATH  96
+#define ASSET_MAX_DEPTH 3
+#define ASSET_MAX_SIZE  (2 * 1024 * 1024)
+#define ASSET_MAX_LIST  200
+#define ASSET_BUF_SIZE  (8 * 1024)
+/* Applies when an asset is opened as a document (e.g. an SVG), so SD content cannot run script. */
+#define ASSET_CSP "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'"
+
 static const char *TAG = "web";
 
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -68,6 +79,25 @@ static const struct {
     {FRAMESIZE_UXGA, "UXGA 1600x1200"},
     {FRAMESIZE_FHD, "FHD 1920x1080"},
     {FRAMESIZE_QXGA, "QXGA 2048x1536"},
+};
+
+/* Only passive content is served from the SD card; HTML and JavaScript stay in the firmware. */
+static const struct {
+    const char *ext;
+    const char *type;
+} ASSET_TYPES[] = {
+    {"css", "text/css; charset=utf-8"},
+    {"png", "image/png"},
+    {"jpg", "image/jpeg"},
+    {"jpeg", "image/jpeg"},
+    {"gif", "image/gif"},
+    {"webp", "image/webp"},
+    {"svg", "image/svg+xml"},
+    {"ico", "image/x-icon"},
+    {"woff", "font/woff"},
+    {"woff2", "font/woff2"},
+    {"ttf", "font/ttf"},
+    {"otf", "font/otf"},
 };
 
 /* ---------- helpers ---------- */
@@ -333,6 +363,10 @@ static esp_err_t index_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    /* custom.css comes from the SD card; keep it from pulling in anything off-device. */
+    httpd_resp_set_hdr(req, "Content-Security-Policy",
+                       "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                       "img-src 'self' data: blob:; font-src 'self' data:; frame-ancestors 'none'");
     return httpd_resp_send(req, index_html_start, index_html_end - index_html_start);
 }
 
@@ -665,6 +699,215 @@ static esp_err_t file_post(httpd_req_t *req)
     return send_result(req, rc == 0, rc == 0 ? NULL : "失敗しました");
 }
 
+/* ---------- UI assets on the SD card (www/) ---------- */
+
+static const char *asset_type(const char *rel)
+{
+    const char *dot = strrchr(rel, '.');
+    if (!dot) return NULL;
+    for (size_t i = 0; i < sizeof(ASSET_TYPES) / sizeof(ASSET_TYPES[0]); i++) {
+        if (strcasecmp(dot + 1, ASSET_TYPES[i].ext) == 0) return ASSET_TYPES[i].type;
+    }
+    return NULL;
+}
+
+/* "img/bg.png" -> "/sdcard/www/img/bg.png". Segments are [A-Za-z0-9_.-] and may not start
+ * with '.', which rules out "..", hidden files and absolute paths. */
+static bool resolve_asset(const char *rel, char *path, size_t cap, bool require_type)
+{
+    const size_t len = strlen(rel);
+    if (len == 0 || len > ASSET_MAX_PATH || (require_type && !asset_type(rel))) return false;
+    int depth = 0;
+    const char *seg = rel;
+    for (const char *p = rel;; p++) {
+        if (*p == '/' || *p == '\0') {
+            if (p == seg || *seg == '.' || ++depth > ASSET_MAX_DEPTH) return false;
+            if (*p == '\0') break;
+            seg = p + 1;
+        } else if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-' && *p != '.') {
+            return false;
+        }
+    }
+    snprintf(path, cap, ASSET_DIR "/%s", rel);
+    return true;
+}
+
+static esp_err_t serve_asset(httpd_req_t *req, const char *rel)
+{
+    char path[128];
+    struct stat st;
+    if (!resolve_asset(rel, path, sizeof(path), true) || !storage_is_mounted() || stat(path, &st) != 0 ||
+        !S_ISREG(st.st_mode)) {
+        return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
+    }
+
+    char etag[48], match[48];
+    snprintf(etag, sizeof(etag), "\"%llx-%llx\"", (unsigned long long)st.st_mtime,
+             (unsigned long long)st.st_size);
+    httpd_resp_set_hdr(req, "ETag", etag);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", match, sizeof(match)) == ESP_OK &&
+        strcmp(match, etag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        return httpd_resp_send(req, NULL, 0);
+    }
+
+    int fd = open(path, O_RDONLY);
+    char *buf = heap_caps_malloc(ASSET_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (fd < 0 || !buf) {
+        if (fd >= 0) close(fd);
+        heap_caps_free(buf);
+        return httpd_resp_send_500(req);
+    }
+    httpd_resp_set_type(req, asset_type(rel));
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "Content-Security-Policy", ASSET_CSP);
+    esp_err_t err = ESP_OK;
+    ssize_t r;
+    while (err == ESP_OK && (r = read(fd, buf, ASSET_BUF_SIZE)) > 0) {
+        err = httpd_resp_send_chunk(req, buf, r);
+    }
+    close(fd);
+    heap_caps_free(buf);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
+    return err;
+}
+
+static esp_err_t assets_get(httpd_req_t *req)
+{
+    char rel[ASSET_MAX_PATH + 2];
+    const char *p = req->uri + strlen("/assets/");
+    const size_t len = strcspn(p, "?#");
+    if (len >= sizeof(rel)) return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
+    memcpy(rel, p, len);
+    rel[len] = '\0';
+    return serve_asset(req, rel);
+}
+
+static esp_err_t favicon_get(httpd_req_t *req)
+{
+    return serve_asset(req, "favicon.ico");
+}
+
+static void list_assets(cJSON *files, const char *ff_path, const char *rel, int depth)
+{
+    FF_DIR dir;
+    FILINFO info;
+    if (f_opendir(&dir, ff_path) != FR_OK) return;
+    while (cJSON_GetArraySize(files) < ASSET_MAX_LIST && f_readdir(&dir, &info) == FR_OK && info.fname[0]) {
+        char child[ASSET_MAX_PATH + 2];
+        if (snprintf(child, sizeof(child), "%s%s%s", rel, rel[0] ? "/" : "", info.fname) >= (int)sizeof(child)) {
+            continue;
+        }
+        if (info.fattrib & AM_DIR) {
+            char child_ff[ASSET_MAX_PATH + 16];
+            if (depth + 1 < ASSET_MAX_DEPTH &&
+                snprintf(child_ff, sizeof(child_ff), "%s/%s", ff_path, info.fname) < (int)sizeof(child_ff)) {
+                list_assets(files, child_ff, child, depth + 1);
+            }
+            continue;
+        }
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "p", child);
+        cJSON_AddNumberToObject(item, "s", (double)info.fsize);
+        cJSON_AddBoolToObject(item, "served", asset_type(child) != NULL);
+        cJSON_AddItemToArray(files, item);
+    }
+    f_closedir(&dir);
+}
+
+static esp_err_t assets_list_get(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    const bool mounted = storage_is_mounted();
+    cJSON_AddBoolToObject(root, "mounted", mounted);
+    cJSON *files = cJSON_AddArrayToObject(root, "files");
+    if (mounted) {
+        char ff_path[16];
+        snprintf(ff_path, sizeof(ff_path), "%s/www", storage_ff_drive());
+        list_assets(files, ff_path, "", 0);
+    }
+    return send_json(req, root);
+}
+
+static void make_parent_dirs(const char *path)
+{
+    char dir[128];
+    strlcpy(dir, path, sizeof(dir));
+    for (char *p = dir + strlen(SD_MOUNT_POINT) + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        mkdir(dir, 0775);
+        *p = '/';
+    }
+}
+
+/* Raw request body, target path in the X-Asset-Path header. */
+static esp_err_t asset_upload_post(httpd_req_t *req)
+{
+    char rel[ASSET_MAX_PATH + 2] = "", path[128], tmp[136];
+    if (httpd_req_get_hdr_value_str(req, "X-Asset-Path", rel, sizeof(rel)) != ESP_OK ||
+        !resolve_asset(rel, path, sizeof(path), true)) {
+        return send_result(req, false, "ファイル名が不正か、対応していない形式です");
+    }
+    if (!storage_is_mounted()) return send_result(req, false, "SDカードがありません");
+    if (req->content_len <= 0 || req->content_len > ASSET_MAX_SIZE) {
+        return send_result(req, false, "ファイルは 2MB までです");
+    }
+
+    make_parent_dirs(path);
+    snprintf(tmp, sizeof(tmp), "%s.part", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+    char *buf = heap_caps_malloc(ASSET_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    bool ok = fd >= 0 && buf;
+    size_t remaining = req->content_len, used = 0;
+    int timeouts = 0;
+    while (ok && remaining > 0) {
+        size_t want = ASSET_BUF_SIZE - used;
+        if (want > remaining) want = remaining;
+        int r = httpd_req_recv(req, buf + used, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts < 10) continue;
+        if (r <= 0) {
+            ok = false;
+            break;
+        }
+        used += r;
+        remaining -= r;
+        if (used == ASSET_BUF_SIZE || remaining == 0) {
+            ok = write(fd, buf, used) == (ssize_t)used;
+            used = 0;
+        }
+    }
+    if (fd >= 0 && close(fd) != 0) ok = false;
+    heap_caps_free(buf);
+    if (ok) {
+        unlink(path);
+        ok = rename(tmp, path) == 0;
+    }
+    if (!ok) {
+        unlink(tmp);
+        return send_result(req, false, "SDカードに書き込めませんでした");
+    }
+    ESP_LOGI(TAG, "asset uploaded: %s (%u bytes)", rel, (unsigned)req->content_len);
+    return send_result(req, true, NULL);
+}
+
+static esp_err_t asset_delete_post(httpd_req_t *req)
+{
+    cJSON *j = read_json(req);
+    char rel[ASSET_MAX_PATH + 2] = "", path[128];
+    if (j) json_str(j, "path", rel, sizeof(rel));
+    cJSON_Delete(j);
+    if (!resolve_asset(rel, path, sizeof(path), false)) return send_result(req, false, "ファイル名が不正です");
+    if (unlink(path) != 0) return send_result(req, false, "削除できませんでした");
+    /* Drop directories left empty; rmdir refuses non-empty ones. */
+    for (char *slash = strrchr(path, '/'); slash && slash > path + strlen(ASSET_DIR); slash = strrchr(path, '/')) {
+        *slash = '\0';
+        if (rmdir(path) != 0) break;
+    }
+    return send_result(req, true, NULL);
+}
+
 static esp_err_t format_post(httpd_req_t *req)
 {
     cJSON *j = read_json(req);
@@ -802,6 +1045,11 @@ esp_err_t web_start(void)
         {.uri = "/api/reboot", .method = HTTP_POST, .handler = reboot_post},
         {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_post},
         {.uri = "/api/log", .method = HTTP_GET, .handler = log_get},
+        {.uri = "/assets/*", .method = HTTP_GET, .handler = assets_get},
+        {.uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get},
+        {.uri = "/api/assets", .method = HTTP_GET, .handler = assets_list_get},
+        {.uri = "/api/assets/upload", .method = HTTP_POST, .handler = asset_upload_post},
+        {.uri = "/api/assets/delete", .method = HTTP_POST, .handler = asset_delete_post},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect},
         {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_redirect},
         {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect},
