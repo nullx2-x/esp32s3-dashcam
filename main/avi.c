@@ -244,19 +244,29 @@ esp_err_t avi_writer_add_frame(avi_writer_t *w, const uint8_t *jpeg, size_t len,
     return ESP_OK;
 }
 
+/* Offset just past a chunk, including the word-alignment pad. */
+static uint64_t frame_end_pos(const index_entry_t *e)
+{
+    return MOVI_FOURCC_AT + (uint64_t)e->offset + 8u + e->size + (e->size & 1u);
+}
+
 esp_err_t avi_writer_sync(avi_writer_t *w)
 {
     if (w->flushed == 0) return ESP_OK;
-    /* Only describe what is already on the card. */
+    /* Flushes are fixed 32 KiB blocks, so the tail is usually a partial chunk.
+     * Describe only the last whole frame: a power cut then leaves a playable
+     * file instead of a movi list that ends mid-chunk. */
     uint32_t frames_on_disk = 0;
+    uint64_t end_on_disk = HEADER_SIZE;
     for (uint32_t i = w->frames; i > 0; i--) {
-        const index_entry_t *e = &w->index[i - 1];
-        if (MOVI_FOURCC_AT + (uint64_t)e->offset + 8 + e->size <= w->flushed) {
+        uint64_t end = frame_end_pos(&w->index[i - 1]);
+        if (end <= w->flushed) {
             frames_on_disk = i;
+            end_on_disk = end;
             break;
         }
     }
-    esp_err_t err = write_header(w, (uint32_t)(w->flushed - 8), (uint32_t)(w->flushed - MOVI_FOURCC_AT),
+    esp_err_t err = write_header(w, (uint32_t)(end_on_disk - 8), (uint32_t)(end_on_disk - MOVI_FOURCC_AT),
                                  frames_on_disk, false);
     if (err == ESP_OK && fsync(w->fd) != 0) err = ESP_FAIL;
     return err;
